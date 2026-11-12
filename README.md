@@ -10,6 +10,12 @@ using averaged random Fourier features. A-RaDR scores a larger candidate pool
 and retains features according to distribution variance, kernel alignment, or
 leverage scores.
 
+A **bag** is a group of observations that share one prediction target. For
+example, a bag might contain repeated sensor measurements from one production
+batch, with the batch's final quality as its target. Each measurement is an
+**instance**. The model summarizes all instances in a bag and predicts one label
+or number for the whole bag. Instance order is not modeled as a time sequence.
+
 - `RaDRClassifier` / `RaDRRegressor`: ordinary random-feature bag embeddings.
 - `ARaDRClassifier` / `ARaDRRegressor`: adaptive embeddings using distribution
   variance (`dv`), kernel alignment (`ka`), leverage (`leverage`), or a custom score.
@@ -28,8 +34,12 @@ Run the following command from the package directory containing `pyproject.toml`
 python -m pip install .
 ```
 
-In the distribution-regression research repository, the package is located in
-`radr_package`; from that repository's root, use `python -m pip install ./radr_package`.
+This installs the `radr` Python package and the `radr-preprocess` command, including
+the required dependencies. To check the installation with generated data:
+
+```bash
+python examples/quickstart.py
+```
 
 For the optional PyTorch data-loading helpers:
 
@@ -39,6 +49,73 @@ python -m pip install ".[torch]"
 
 Both RaDR and A-RaDR estimators are included in the `radr` distribution. See the
 [contribution guide](CONTRIBUTING.md) for development installation and testing.
+
+## Prepare your dataset
+
+There are two input paths:
+
+- **CSV or pandas DataFrame:** one row per instance. Use `BagPreprocessor` or
+  `radr-preprocess` to group rows, encode categories, and scale features.
+- **Numeric arrays in Python:** one 2D array per bag and one target per bag.
+  Pass these directly to an estimator as shown in [Train and predict](#train-and-predict).
+
+### CSV layout
+
+Save a comma-separated file with a header row, such as `instances.csv`:
+
+```csv
+bag_id,temperature,material,target
+batch_001,21.4,steel,7.2
+batch_001,22.1,steel,7.2
+batch_002,18.0,aluminum,4.8
+batch_002,19.3,aluminum,4.8
+batch_002,18.7,aluminum,4.8
+batch_003,25.2,steel,8.1
+batch_003,24.6,steel,8.1
+```
+
+This example has **seven instances, three bags, two input columns, and three
+regression targets**. `batch_002` becomes a bag with three rows; its target is
+`4.8`. One-hot encoding can expand the two input columns into more numeric features.
+The snippet illustrates the format; use more bags for meaningful training and
+evaluation, especially when using cross-validation.
+
+| Column role | Example | Requirements |
+| --- | --- | --- |
+| Bag ID | `bag_id` | Required for tables. A nonmissing string or number identifying the group; repeat it for every instance in that bag. |
+| Numeric features | `temperature` | One measurement per row; finite numeric values after preprocessing. |
+| Categorical features | `material` | Text or explicitly selected categorical columns; encoded using the training vocabulary. |
+| Target | `target` | Required for supervised training and evaluation. By default, repeat the same nonmissing target on every row of a bag. Omit it for prediction. |
+
+Column names are configurable; these names are used throughout the examples.
+Rows belonging to the same bag do not need to be adjacent. Bags can have different
+numbers of instances, but must share the same feature definitions. Do not pad
+short bags with artificial rows. Each retained bag must contain at least one
+instance, or `min_bag_size` instances if that option is increased.
+
+For **regression**, targets must be finite numbers. For **classification**, use
+class labels such as `pass` / `fail` or `0` / `1`, with at least two classes in the
+training split. The number of supervised examples is the number of bags, not the
+number of CSV rows.
+
+Select `feature_cols` explicitly to exclude unrelated IDs, notes, and columns
+that reveal the target. Otherwise, all columns except the configured bag ID,
+target, and sort columns become features. Missing bag IDs and targets are errors.
+Missing features follow `missing="drop"` (the default), `"fill"`, or `"error"`;
+infinite features are rejected. Dropping rows can remove an entire bag.
+
+If your labels are stored in a separate table with one row per bag, join them
+onto the instance table by bag ID before using the CSV workflow. In Python,
+`BagPreprocessor(bag_label_map=...)` also accepts a dictionary mapping bag IDs to
+targets. If rows intentionally have different targets within a bag, use
+`label_mode="aggregate"` with an explicit aggregation such as `"mean"` for
+regression or `"mode"` for classification; the default `label_mode="bag"` rejects
+inconsistent targets.
+
+**Split by bag ID before fitting preprocessing.** All instances of a bag must
+stay in the same split. Fit encoders and scalers on training data only, then reuse
+them for validation, test, and prediction data. The Python example below and the
+CLI both follow this pattern.
 
 ## Train and predict
 
@@ -137,15 +214,46 @@ to retain raw indicators. See [API reference](docs/API.md) for return types and 
 
 ## Command line
 
+From a terminal, preprocess the CSV described above (replace the file path and
+column names with your own):
+
 ```bash
-radr-preprocess --input-csv instances.csv --output-dir prepared --task regression --bag-id-col bag_id --target-col target --feature-cols temperature,material --categorical-cols material --categorical-encoding onehot
+radr-preprocess --input-csv instances.csv --output-dir prepared --task regression --bag-id-col bag_id --target-col target --feature-cols temperature,material --categorical-cols material --categorical-encoding onehot --missing error --random-state 0
 ```
 
 The CLI splits bags first, fits encoders/scaling on training rows, and writes
-`train_radr.npz`, `test_radr.npz`, and `preprocessor.joblib`. Original bag IDs are
-preserved. `--stratify` supports classification. Omit `--target-col` for unlabeled
-preprocessing. Load archives with `radr.load_npz(path)`; these archives store numeric
-arrays and JSON. Load the saved transformer with `joblib.load` from trusted sources.
+the following files under `prepared/`:
+
+| File | Contents |
+| --- | --- |
+| `train_radr.npz` | Training bags, targets (if supplied), original bag IDs, and metadata. |
+| `test_radr.npz` | Held-out bags transformed with the training preprocessor, with targets/IDs/metadata. |
+| `preprocessor.joblib` | Fitted categorical vocabulary and scaling statistics for future data. |
+
+The default test fraction is `0.2`; change it with `--test-size`. For
+classification, use `--task classification` and optionally `--stratify` to
+preserve class proportions where class counts and split sizes permit. Omit
+`--target-col` for unlabeled preprocessing; this still creates a train/test split
+and fits a new preprocessor. For prediction with an existing model, load its
+saved preprocessor and call `transform` instead.
+
+The CLI only prepares data; it does not train a model. Train and evaluate from
+its output in Python:
+
+```python
+from radr import ARaDRRegressor, load_npz
+
+train = load_npz("prepared/train_radr.npz")
+test = load_npz("prepared/test_radr.npz")
+model = ARaDRRegressor(n_features=64, random_state=0)
+model.fit(train.bags, train.targets)
+print(model.test(test.bags, test.targets))
+# model.predict(test.bags)[i] corresponds to test.bag_ids[i].
+```
+
+These `.npz` files use RaDR's numeric-array/JSON format; an arbitrary NumPy
+archive is not interchangeable. Use `save_npz` to create compatible archives
+from your own numeric bags. Load the saved transformer with `joblib.load` from trusted sources.
 Save a fitted estimator with `joblib.dump` in the same way; record dependency
 versions and restore the same environment when loading saved models.
 
